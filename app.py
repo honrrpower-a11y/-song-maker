@@ -4,6 +4,8 @@ from gradio_client import Client
 from pathlib import Path
 import requests
 import os
+import io
+import contextlib
 
 st.set_page_config(
     page_title="سازنده آهنگ",
@@ -27,92 +29,40 @@ with st.form("song_form"):
 
 def get_hf_token():
     try:
-        return st.secrets.get("HF_API_KEY", None)
+        return st.secrets.get("HF_API_KEY")
     except Exception:
         return os.environ.get("HF_API_KEY")
 
-def download_audio(result):
-    """تبدیل خروجی Space به داده صوتی قابل پخش."""
+def get_audio(result):
     if isinstance(result, dict):
-        result = (
-            result.get("audio")
-            or result.get("path")
-            or result.get("url")
-        )
-
-    # بعضی APIها خروجی (sample_rate, audio_array) دارند.
-    if (
-        isinstance(result, tuple)
-        and len(result) == 2
-        and isinstance(result[0], (int, float))
-    ):
-        import numpy as np
-        import io
-        import wave
-
-        sample_rate, audio_array = result
-        audio_array = np.asarray(audio_array)
-
-        if audio_array.dtype.kind == "f":
-            audio_array = np.clip(
-                audio_array, -1, 1
-            )
-            audio_array = (audio_array * 32767).astype(
-                np.int16
-            )
-
-        buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as wav:
-            wav.setnchannels(
-                1 if audio_array.ndim == 1
-                else audio_array.shape[1]
-            )
-            wav.setsampwidth(2)
-            wav.setframerate(int(sample_rate))
-            wav.writeframes(audio_array.tobytes())
-
-        return buffer.getvalue(), "audio/wav", "my_song.wav"
+        for key in ("audio", "path", "url", "video"):
+            if result.get(key):
+                return get_audio(result[key])
 
     if isinstance(result, (list, tuple)):
         for item in reversed(result):
             try:
-                return download_audio(item)
+                return get_audio(item)
             except (ValueError, TypeError, OSError):
                 continue
-        raise ValueError("خروجی شامل فایل صوتی قابل استفاده نیست.")
+        raise ValueError("فایل صوتی در خروجی پیدا نشد.")
 
-    if isinstance(result, dict):
-        raise ValueError("آدرس فایل صوتی در خروجی پیدا نشد.")
+    if isinstance(result, (str, os.PathLike)):
+        value = str(result)
 
-    if not isinstance(result, (str, os.PathLike)):
-        raise ValueError(
-            f"نوع خروجی صوتی پشتیبانی نمی‌شود: {type(result).__name__}"
-        )
+        if value.startswith(("https://", "http://")):
+            response = requests.get(value, timeout=180)
+            response.raise_for_status()
+            return response.content, Path(value.split("?")[0]).suffix.lower()
 
-    value = str(result)
+        path = Path(value)
+        if path.is_file():
+            return path.read_bytes(), path.suffix.lower()
 
-    if value.startswith(("https://", "http://")):
-        response = requests.get(value, timeout=120)
-        response.raise_for_status()
-        content_type = response.headers.get(
-            "Content-Type", ""
-        )
-        ext = ".mp3" if "mpeg" in content_type else ".wav"
-        mime = "audio/mpeg" if ext == ".mp3" else "audio/wav"
-        return response.content, mime, "my_song" + ext
-
-    path = Path(value)
-    if path.is_file():
-        ext = path.suffix.lower()
-        mime = {
-            ".mp3": "audio/mpeg",
-            ".ogg": "audio/ogg",
-            ".wav": "audio/wav",
-            ".flac": "audio/flac",
-        }.get(ext, "audio/wav")
-        return path.read_bytes(), mime, path.name
-
-    raise ValueError("فایل صوتی در مسیر برگشتی پیدا نشد.")
+    raise ValueError(
+        "سرویس فایل صوتی قابل دانلود برنگرداند. "
+        f"نوع خروجی: {type(result).__name__}"
+    )
 
 if submitted:
     if not prompt.strip():
@@ -120,46 +70,105 @@ if submitted:
     else:
         try:
             token = get_hf_token()
-            client_args = {"token": token} if token else {}
+            args = {"token": token} if token else {}
 
-            with st.spinner(
-                "در حال اتصال به سرویس موسیقی..."
-            ):
-                client = Client(
-                    "facebook/MusicGen",
-                    **client_args
+            with st.spinner("در حال اتصال به سرویس موسیقی..."):
+                client = Client("facebook/MusicGen", **args)
+
+            # دریافت مشخصات واقعی API
+            with st.spinner("در حال بررسی تابع‌های سرویس..."):
+                api_text = io.StringIO()
+                with contextlib.redirect_stdout(api_text):
+                    api_info = client.view_api(return_format="dict")
+
+            if not isinstance(api_info, dict):
+                raise RuntimeError(
+                    "مشخصات API قابل خواندن نیست. "
+                    "نسخه gradio_client را به‌روز کن."
                 )
 
-            with st.spinner(
-                "در حال درخواست ساخت آهنگ؛ لطفاً صبر کن..."
-            ):
-                # نقطه پایانی متداول Space رسمی MusicGen
-                result = client.predict(
-                    prompt.strip(),
-                    None,
-                    api_name="/predict"
-                )
+            named = api_info.get("named_endpoints", {})
+            candidates = []
 
-            audio_bytes, mime, filename = download_audio(result)
+            for name, details in named.items():
+                params = details.get("parameters", [])
+                param_names = [
+                    str(p.get("parameter_name", "")).lower()
+                    for p in params
+                ]
+                if any(
+                    word in pname
+                    for pname in param_names
+                    for word in ("text", "prompt", "description")
+                ):
+                    candidates.append((name, params, param_names))
 
-            st.success("خروجی صوتی دریافت شد! 🎵")
-            st.audio(audio_bytes, format=mime)
+            if not candidates:
+                st.error("تابع مناسب ساخت آهنگ پیدا نشد.")
+                st.write("تابع‌های موجود در سرویس:")
+                st.code(api_text.getvalue() or str(api_info))
+                st.stop()
+
+            # انتخاب تابعی که ورودی متن آهنگ دارد
+            endpoint, params, param_names = candidates[0]
+            inputs = []
+
+            for p, pname in zip(params, param_names):
+                if any(x in pname for x in ("text", "prompt", "description")):
+                    inputs.append(prompt.strip())
+                elif "model" in pname or "version" in pname:
+                    inputs.append("small")
+                elif "melody" in pname or "audio" in pname:
+                    inputs.append(None)
+                elif "duration" in pname:
+                    inputs.append(8)
+                elif "topk" in pname or "top_k" in pname:
+                    inputs.append(250)
+                elif "topp" in pname or "top_p" in pname:
+                    inputs.append(0.0)
+                elif "temperature" in pname:
+                    inputs.append(1.0)
+                elif "cfg" in pname:
+                    inputs.append(3.0)
+                else:
+                    # استفاده از مقدار پیش‌فرض اعلام‌شده در API
+                    inputs.append(p.get("parameter_default", None))
+
+            with st.spinner("در حال ساخت آهنگ؛ لطفاً صبر کن..."):
+                result = client.predict(*inputs, api_name=endpoint)
+
+            audio_bytes, ext = get_audio(result)
+
+            mime_types = {
+                ".wav": "audio/wav",
+                ".mp3": "audio/mpeg",
+                ".ogg": "audio/ogg",
+                ".flac": "audio/flac",
+                ".mp4": "video/mp4",
+                ".webm": "video/webm",
+            }
+            mime = mime_types.get(ext, "application/octet-stream")
+
+            if ext in (".mp4", ".webm"):
+                st.success("خروجی سرویس دریافت شد.")
+                st.video(audio_bytes)
+            else:
+                st.success("خروجی دریافت شد! 🎵")
+                st.audio(audio_bytes, format=mime)
 
             st.download_button(
-                "⬇️ دانلود آهنگ",
+                "⬇️ دانلود خروجی",
                 data=audio_bytes,
-                file_name=filename,
+                file_name="my_song" + (ext or ".wav"),
                 mime=mime,
                 use_container_width=True
             )
 
         except Exception as e:
             st.error("ساخت آهنگ ناموفق بود.")
-            st.code(str(e))
-
+            st.code(f"{type(e).__name__}: {e}")
             st.info(
-                "اگر خطا درباره API یا تعداد ورودی‌هاست، "
-                "باید مشخصات فعلی Space را بررسی کنیم. "
-                "اگر خطا درباره دسترسی است، وضعیت Space "
-                "و توکن را بررسی کن."
+                "اگر خطای API دیدی، مشخصات Space یا ورودی‌های آن "
+                "ممکن است تغییر کرده باشد. اگر خطای دسترسی دیدی، "
+                "وضعیت Space و توکن Hugging Face را بررسی می‌کنیم."
             )
