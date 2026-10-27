@@ -3,125 +3,163 @@ import streamlit as st
 from gradio_client import Client
 from pathlib import Path
 import requests
-import time
+import os
 
-st.set_page_config(page_title="سازنده آهنگ", page_icon="🎵")
+st.set_page_config(
+    page_title="سازنده آهنگ",
+    page_icon="🎵",
+    layout="centered"
+)
 
 st.title("🎵 سازنده آهنگ")
-st.write("خواسته‌ات را بنویس تا آهنگش را بسازیم.")
+st.write("توضیحت را بنویس تا تلاش کنیم آهنگش را بسازیم.")
 
 with st.form("song_form"):
     prompt = st.text_area(
         "چه آهنگی می‌خوای؟",
-        placeholder="مثلاً: calm ambient music with soft piano"
+        placeholder="مثلاً: calm ambient music with soft piano",
+        height=120
     )
-    submitted = st.form_submit_button("بساز")
+    submitted = st.form_submit_button(
+        "🎶 بساز",
+        use_container_width=True
+    )
+
+def get_hf_token():
+    try:
+        return st.secrets.get("HF_API_KEY", None)
+    except Exception:
+        return os.environ.get("HF_API_KEY")
+
+def download_audio(result):
+    """تبدیل خروجی Space به داده صوتی قابل پخش."""
+    if isinstance(result, dict):
+        result = (
+            result.get("audio")
+            or result.get("path")
+            or result.get("url")
+        )
+
+    # بعضی APIها خروجی (sample_rate, audio_array) دارند.
+    if (
+        isinstance(result, tuple)
+        and len(result) == 2
+        and isinstance(result[0], (int, float))
+    ):
+        import numpy as np
+        import io
+        import wave
+
+        sample_rate, audio_array = result
+        audio_array = np.asarray(audio_array)
+
+        if audio_array.dtype.kind == "f":
+            audio_array = np.clip(
+                audio_array, -1, 1
+            )
+            audio_array = (audio_array * 32767).astype(
+                np.int16
+            )
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav:
+            wav.setnchannels(
+                1 if audio_array.ndim == 1
+                else audio_array.shape[1]
+            )
+            wav.setsampwidth(2)
+            wav.setframerate(int(sample_rate))
+            wav.writeframes(audio_array.tobytes())
+
+        return buffer.getvalue(), "audio/wav", "my_song.wav"
+
+    if isinstance(result, (list, tuple)):
+        for item in reversed(result):
+            try:
+                return download_audio(item)
+            except (ValueError, TypeError, OSError):
+                continue
+        raise ValueError("خروجی شامل فایل صوتی قابل استفاده نیست.")
+
+    if isinstance(result, dict):
+        raise ValueError("آدرس فایل صوتی در خروجی پیدا نشد.")
+
+    if not isinstance(result, (str, os.PathLike)):
+        raise ValueError(
+            f"نوع خروجی صوتی پشتیبانی نمی‌شود: {type(result).__name__}"
+        )
+
+    value = str(result)
+
+    if value.startswith(("https://", "http://")):
+        response = requests.get(value, timeout=120)
+        response.raise_for_status()
+        content_type = response.headers.get(
+            "Content-Type", ""
+        )
+        ext = ".mp3" if "mpeg" in content_type else ".wav"
+        mime = "audio/mpeg" if ext == ".mp3" else "audio/wav"
+        return response.content, mime, "my_song" + ext
+
+    path = Path(value)
+    if path.is_file():
+        ext = path.suffix.lower()
+        mime = {
+            ".mp3": "audio/mpeg",
+            ".ogg": "audio/ogg",
+            ".wav": "audio/wav",
+            ".flac": "audio/flac",
+        }.get(ext, "audio/wav")
+        return path.read_bytes(), mime, path.name
+
+    raise ValueError("فایل صوتی در مسیر برگشتی پیدا نشد.")
 
 if submitted:
     if not prompt.strip():
         st.warning("لطفاً توضیح آهنگ را بنویس.")
     else:
         try:
-            # خواندن توکن اختیاری از Secrets
-            try:
-                token = st.secrets.get("HF_API_KEY", None)
-            except Exception:
-                token = None
+            token = get_hf_token()
+            client_args = {"token": token} if token else {}
 
             with st.spinner(
-                "در حال اتصال به موتور ساخت موسیقی... "
-                "ممکن است کمی طول بکشد."
+                "در حال اتصال به سرویس موسیقی..."
             ):
-                client_args = {"token": token} if token else {}
                 client = Client(
                     "facebook/MusicGen",
                     **client_args
                 )
 
             with st.spinner(
-                "در صف ساخت آهنگ هستیم؛ لطفاً صبر کن... 🎶"
+                "در حال درخواست ساخت آهنگ؛ لطفاً صبر کن..."
             ):
+                # نقطه پایانی متداول Space رسمی MusicGen
                 result = client.predict(
                     prompt.strip(),
                     None,
-                    fn_index=0
+                    api_name="/predict"
                 )
 
-            # در نسخه‌های مختلف Space ممکن است خروجی متفاوت باشد.
-            audio_result = result
+            audio_bytes, mime, filename = download_audio(result)
 
-            if isinstance(result, (list, tuple)):
-                if len(result) > 1 and result[1] is not None:
-                    audio_result = result[1]
-                elif len(result) > 0:
-                    audio_result = result[0]
+            st.success("خروجی صوتی دریافت شد! 🎵")
+            st.audio(audio_bytes, format=mime)
 
-            # خروجی ممکن است مسیر فایل یا دیکشنری باشد.
-            if isinstance(audio_result, dict):
-                audio_result = (
-                    audio_result.get("path")
-                    or audio_result.get("url")
-                    or audio_result.get("name")
-                )
-
-            if not audio_result:
-                st.error("مدل اجرا شد، اما فایل صوتی برنگشت.")
-                st.write("خروجی دریافتی:", result)
-
-            elif isinstance(audio_result, str) and audio_result.startswith(
-                ("http://", "https://")
-            ):
-                response = requests.get(
-                    audio_result,
-                    timeout=120
-                )
-                response.raise_for_status()
-                audio_bytes = response.content
-
-                st.success("آهنگ آماده است! 🎶")
-                st.audio(audio_bytes)
-                st.download_button(
-                    "⬇️ دانلود آهنگ",
-                    data=audio_bytes,
-                    file_name="my_song.wav",
-                    mime="audio/wav"
-                )
-
-            else:
-                audio_path = Path(str(audio_result))
-
-                if not audio_path.is_file():
-                    st.error("فایل صوتی در مسیر برگشتی پیدا نشد.")
-                    st.write("مسیر دریافتی:", str(audio_result))
-                else:
-                    audio_bytes = audio_path.read_bytes()
-
-                    st.success("آهنگ آماده است! 🎶")
-                    st.audio(audio_bytes)
-                    st.download_button(
-                        "⬇️ دانلود آهنگ",
-                        data=audio_bytes,
-                        file_name=audio_path.name,
-                        mime="audio/wav"
-                    )
+            st.download_button(
+                "⬇️ دانلود آهنگ",
+                data=audio_bytes,
+                file_name=filename,
+                mime=mime,
+                use_container_width=True
+            )
 
         except Exception as e:
-            error_text = str(e)
             st.error("ساخت آهنگ ناموفق بود.")
-            st.write("جزئیات خطا:", error_text)
+            st.code(str(e))
 
-            if "429" in error_text or "rate limit" in error_text.lower():
-                st.info(
-                    "محدودیت درخواست ایجاد شده است. "
-                    "کمی صبر کن و دوباره امتحان کن."
-                )
-            elif "401" in error_text or "403" in error_text:
-                st.info(
-                    "دسترسی رد شده است. توکن Hugging Face "
-                    "و مجوزهای آن را بررسی کن."
-                )
-            else:
-                st.info(
-                    "ممکن است Space در دسترس نباشد یا "
-                    "پارامترهای API آن تغییر کرده باشند."
-                )
+            st.info(
+                "اگر خطا درباره API یا تعداد ورودی‌هاست، "
+                "باید مشخصات فعلی Space را بررسی کنیم. "
+                "اگر خطا درباره دسترسی است، وضعیت Space "
+                "و توکن را بررسی کن."
+            )
