@@ -1,21 +1,26 @@
 import streamlit as st
+import requests
 
 st.set_page_config(page_title="سازنده آهنگ", page_icon="🎵")
-
 st.title("🎵 سازنده آهنگ")
-st.write("خواسته‌ات را بنویس تا آهنگش را بسازیم.")
+
+HF_API_KEY = st.secrets["HF_API_KEY"]
 
 with st.form("song_form"):
-    prompt = st.text_area(
-        "چه آهنگی می‌خوای؟",
-        placeholder="مثلاً: آهنگ ترکی با باغلاما، صدای زن، ریتم ملایم"
-    )
+    prompt = st.text_area("چه آهنگی می‌خوای؟")
     submitted = st.form_submit_button("بساز")
 
-if submitted:
-    if prompt.strip():
-        st.success("درخواست ثبت شد!")
-        st.write("**خواسته شما:**", prompt)
-        st.info("این نسخه آزمایشی است. اتصال به موتور آهنگ‌سازی به‌زودی اضافه می‌شود.")
-    else:
-        st.warning("لطفاً چیزی بنویس.")
+if submitted and prompt:
+    with st.spinner("در حال ساخت..."):
+        API_URL = "https://api-inference.huggingface.co/models/facebook/musicgen-small"
+        headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+        payload = {"inputs": prompt, "parameters": {"duration": 8}}
+        try:
+            response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+            if response.status_code == 200:
+                st.success("آهنگ ساخته شد! 🎶")
+                st.audio(response.content, format="audio/wav")
+            else:
+                st.error(f"خطا. کد: {response.status_code}")
+        except Exception as e:
+            st.error(f"مشکل: {e}")
