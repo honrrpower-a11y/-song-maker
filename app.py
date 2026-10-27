@@ -16,7 +16,7 @@ if submitted:
     if prompt.strip():
         with st.spinner("در حال ساخت آهنگ... (ممکنه ۱۰ تا ۳۰ ثانیه طول بکشه)"):
             # این آدرس جدیدتر و پایدارتر برای Hugging Face است
-            API_URL = "https://api-inference.huggingface.co/models/facebook/musicgen-small"
+            API_URL = "https://router.huggingface.co/hf-inference/models/facebook/musicgen-small"
             headers = {"Authorization": f"Bearer {HF_API_KEY}"}
             payload = {"inputs": prompt}
 
